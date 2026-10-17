@@ -207,10 +207,13 @@ Gateway refuses to start if you set `OPENCLAW_PUID=0` — root is never allowed.
 
 Run `stat -c '%u %g' /path/to/openclaw-config` on the mounted directory itself,
 or `id <user>` for the account that owns it. If you cannot get a shell on the
-host, start the container once with the defaults and read the numeric hint
-`openclaw doctor` prints on an ownership mismatch (`Owner mismatch (uid ...).
-Run: sudo chown -R <uid>:<gid> ...`) — that names the exact uid and gid the
-mounted directory is owned by.
+host, start the container once with the defaults and run `openclaw doctor`.
+On an ownership mismatch it prints `Owner mismatch (uid N)`, where `N` is the
+uid that owns the mounted directory; use it as `OPENCLAW_PUID` (the `chown`
+command in the same hint targets the container's current uid instead). Restart
+with that uid and run `openclaw doctor` again: a `Group mismatch (gid N)` hint
+names the directory's gid for `OPENCLAW_PGID`, and no hint means the gid
+already works.
 
 With `scripts/docker/setup.sh`, put them in the environment and the script
 validates them (decimal only, `0` rejected, max `65533`) and writes them to

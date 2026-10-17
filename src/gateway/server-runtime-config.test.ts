@@ -49,13 +49,25 @@ describe("container runtime identity", () => {
     tailscaleMode: "off" as const,
   };
 
+  // `process.getuid` is absent on Windows, so install a temporary property rather
+  // than spying on a method that may not exist; `undefined` removes it entirely.
+  const originalGetuid = Object.getOwnPropertyDescriptor(process, "getuid");
+
   function withUid(uid: number | undefined) {
-    vi.spyOn(process, "getuid").mockReturnValue(uid as number);
+    if (uid === undefined) {
+      Reflect.deleteProperty(process, "getuid");
+      return;
+    }
+    Object.defineProperty(process, "getuid", { configurable: true, value: () => uid });
   }
 
   afterEach(() => {
     vi.unstubAllEnvs();
-    vi.restoreAllMocks();
+    if (originalGetuid) {
+      Object.defineProperty(process, "getuid", originalGetuid);
+    } else {
+      Reflect.deleteProperty(process, "getuid");
+    }
   });
 
   // Compose accepts user names as well as numeric ids, so every spelling that lands

@@ -307,8 +307,13 @@ describe("Dockerfile", () => {
       expect(service?.user).toBe("${OPENCLAW_PUID:-1000}:${OPENCLAW_PGID:-1000}");
       // /home/node stays uid-1000-owned, so HOME-derived caches must be redirected
       // into the writable state mount before any other runtime uid can use them.
-      expect(service?.environment?.XDG_CACHE_HOME).toBe("/home/node/.openclaw/cache");
-      expect(service?.environment?.NPM_CONFIG_CACHE).toBe("/home/node/.openclaw/.npm");
+      // They are defaults only, so a value an operator already set in .env still wins.
+      expect(service?.environment?.XDG_CACHE_HOME).toBe(
+        "${XDG_CACHE_HOME:-/home/node/.openclaw/cache}",
+      );
+      expect(service?.environment?.NPM_CONFIG_CACHE).toBe(
+        "${NPM_CONFIG_CACHE:-/home/node/.openclaw/.npm}",
+      );
       // Surfaced in-container so the gateway can reject an explicit root request.
       expect(service?.environment?.OPENCLAW_PUID).toBe("${OPENCLAW_PUID:-}");
     }

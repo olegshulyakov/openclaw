@@ -19,8 +19,8 @@ services:
       # HOME-derived caches must live inside the writable state mount so any
       # runtime uid can create them; /home/node itself stays uid-1000-owned.
       # Same redirection fleet cells and the Podman quadlet already rely on.
-      XDG_CACHE_HOME: /home/node/.openclaw/cache
-      NPM_CONFIG_CACHE: /home/node/.openclaw/.npm
+      XDG_CACHE_HOME: ${XDG_CACHE_HOME:-/home/node/.openclaw/cache}
+      NPM_CONFIG_CACHE: ${NPM_CONFIG_CACHE:-/home/node/.openclaw/.npm}
       # Surfaced in-container so the gateway can reject an explicit root request
       # without also rejecting fleet cells, which run --user 0:0 deliberately.
       OPENCLAW_PUID: ${OPENCLAW_PUID:-}
@@ -127,8 +127,8 @@ services:
       OPENCLAW_HOME: /home/node
       TERM: xterm-256color
       # Keep cache redirection identical to the gateway service.
-      XDG_CACHE_HOME: /home/node/.openclaw/cache
-      NPM_CONFIG_CACHE: /home/node/.openclaw/.npm
+      XDG_CACHE_HOME: ${XDG_CACHE_HOME:-/home/node/.openclaw/cache}
+      NPM_CONFIG_CACHE: ${NPM_CONFIG_CACHE:-/home/node/.openclaw/.npm}
       OPENCLAW_PUID: ${OPENCLAW_PUID:-}
       # Pin container-side state, workspace, and config paths so host values written to
       # `.env` cannot leak into runtime code via the env_file import (#77436).

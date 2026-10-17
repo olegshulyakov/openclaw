@@ -122,21 +122,23 @@ NODE
   fi
 }
 
-read_env_gateway_token() {
+# Last non-empty assignment wins, matching how Compose reads .env.
+read_env_value() {
   local env_path="$1"
+  local key="$2"
   local line=""
-  local token=""
+  local value=""
   if [[ ! -f "$env_path" ]]; then
     return 0
   fi
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
-    if [[ "$line" == OPENCLAW_GATEWAY_TOKEN=* ]]; then
-      token="${line#OPENCLAW_GATEWAY_TOKEN=}"
+    if [[ "$line" == "$key="?* ]]; then
+      value="${line#"$key="}"
     fi
   done <"$env_path"
-  if [[ -n "$token" ]]; then
-    printf '%s' "$token"
+  if [[ -n "$value" ]]; then
+    printf '%s' "$value"
   fi
 }
 
@@ -523,6 +525,9 @@ fi
 if [[ -n "$SANDBOX_ENABLED" ]]; then
   validate_mount_path_value "OPENCLAW_DOCKER_SOCKET" "$DOCKER_SOCKET_PATH"
 fi
+# A rerun without the IDs exported keeps the identity saved by the previous run.
+RUNTIME_UID="${RUNTIME_UID:-$(read_env_value "$ROOT_DIR/.env" OPENCLAW_PUID || true)}"
+RUNTIME_GID="${RUNTIME_GID:-$(read_env_value "$ROOT_DIR/.env" OPENCLAW_PGID || true)}"
 if [[ -n "$RUNTIME_UID" ]]; then
   validate_runtime_id "OPENCLAW_PUID" "$RUNTIME_UID"
 fi
@@ -596,7 +601,7 @@ if [[ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]]; then
     OPENCLAW_GATEWAY_TOKEN="$EXISTING_CONFIG_TOKEN"
     echo "Reusing gateway token from $OPENCLAW_CONFIG_DIR/openclaw.json"
   else
-    DOTENV_GATEWAY_TOKEN="$(read_env_gateway_token "$ROOT_DIR/.env" || true)"
+    DOTENV_GATEWAY_TOKEN="$(read_env_value "$ROOT_DIR/.env" OPENCLAW_GATEWAY_TOKEN || true)"
     if [[ -n "$DOTENV_GATEWAY_TOKEN" ]]; then
       OPENCLAW_GATEWAY_TOKEN="$DOTENV_GATEWAY_TOKEN"
       echo "Reusing gateway token from $ROOT_DIR/.env"

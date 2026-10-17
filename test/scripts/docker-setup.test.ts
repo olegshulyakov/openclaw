@@ -613,6 +613,25 @@ describe("scripts/docker/setup.sh", () => {
     expect(envFile).toContain("OPENCLAW_PGID=100");
   });
 
+  it("keeps the saved OPENCLAW_PUID/OPENCLAW_PGID when a rerun does not export them", async () => {
+    const configDir = join(sandbox.rootDir, "config-puid-rerun");
+    await writeFile(join(sandbox.rootDir, ".env"), "OPENCLAW_PUID=1026\nOPENCLAW_PGID=100\n");
+    await resetDockerLog(sandbox);
+
+    const result = runDockerSetup(sandbox, {
+      OPENCLAW_CONFIG_DIR: configDir,
+      OPENCLAW_WORKSPACE_DIR: join(configDir, "workspace"),
+    });
+
+    expect(result.status).toBe(0);
+    const log = await readDockerLog(sandbox);
+    expect(log).toContain(ownershipRepairOwnerArg("1026:100"));
+    expect(log).not.toContain(ownershipRepairOwnerArg("1000:1000"));
+    const envFile = await readFile(join(sandbox.rootDir, ".env"), "utf8");
+    expect(envFile).toContain("OPENCLAW_PUID=1026");
+    expect(envFile).toContain("OPENCLAW_PGID=100");
+  });
+
   it("rejects OPENCLAW_PUID=0 so the container cannot be pinned to root", async () => {
     const result = runDockerSetup(sandbox, {
       OPENCLAW_CONFIG_DIR: join(sandbox.rootDir, "config-puid-root"),

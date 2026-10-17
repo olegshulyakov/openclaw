@@ -2,8 +2,18 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import type { AsyncPreparedSqliteReadOnlyLocation } from "../infra/sqlite-readonly-location.types.js";
 import { createDeferredCore } from "../shared/deferred.js";
-import type { OpenClawStateReadOutcome } from "./openclaw-state-read.types.js";
+import {
+  createReadWorkerFixture,
+  observeAsyncFixture,
+  retainFixturePreparation,
+} from "./openclaw-state-db-readonly.test-support.js";
+import type {
+  OpenClawStateReadAuthority,
+  OpenClawStateReadLocation,
+  OpenClawStateReadOutcome,
+} from "./openclaw-state-read.types.js";
 
 vi.hoisted(() => {
   // Shared setup can preload the real reader; bind this fixture to its transport mocks.
@@ -12,23 +22,22 @@ vi.hoisted(() => {
 
 const mock = vi.hoisted(() => ({
   close: vi.fn<() => Promise<void>>(),
-  read: vi.fn<() => Promise<OpenClawStateReadOutcome>>(),
+  read: vi.fn<
+    (
+      source: OpenClawStateReadLocation,
+      authority: OpenClawStateReadAuthority,
+    ) => Promise<OpenClawStateReadOutcome>
+  >(),
   cleanup: vi.fn<() => Promise<boolean>>(),
   borrow: vi.fn(),
   independent: vi.fn(),
   prepareNative: vi.fn(),
   prepareSource: vi.fn(),
   prepareSourceAsync: vi.fn(),
-  excluded: vi.fn<() => boolean>(),
-  mutation: vi.fn<() => (() => void) | undefined>(),
-  releaseSourcePin: vi.fn(),
+  closePreparation: vi.fn<() => void>(),
+  constructTransport: vi.fn<() => void>(),
 }));
-vi.mock("../infra/state-database-coordinator.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../infra/state-database-coordinator.js")>()),
-  hasStateDatabaseSourceExclusion: mock.excluded,
-  prepareStateDatabaseCanonicalMutation: mock.mutation,
-  acquireStateDatabaseHandleLease: () => ({ release: mock.releaseSourcePin }),
-}));
+
 vi.mock("./openclaw-state-db-cache.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./openclaw-state-db-cache.js")>()),
   borrowOpenClawStateDatabaseForAsyncRead: mock.borrow,
@@ -39,17 +48,49 @@ vi.mock("../infra/sqlite-readonly-location.js", async (importOriginal) => ({
   prepareSqliteReadOnlyLocationFromOwnedDatabase: mock.prepareNative,
 }));
 let finishProducer: (() => void) | undefined;
-vi.mock("./openclaw-state-read-worker.js", () => ({
-  createOpenClawStateReadTransport: () => ({
-    read: mock.read,
-    validateFresh: async () => {},
-    close: mock.close,
-  }),
-}));
+// mock-isolation: Exercise read cleanup with a controlled transport instead of native workers.
+vi.mock("./openclaw-state-read-worker.js", () => {
+  const fixture = createReadWorkerFixture(mock.read, mock.close);
+  return {
+    captureOpenClawStateReadSource() {
+      const capturedSource = fixture.captureOpenClawStateReadSource();
+      return {
+        ...capturedSource,
+        createTransport() {
+          mock.constructTransport();
+          return capturedSource.createTransport();
+        },
+      };
+    },
+  };
+});
 vi.mock("../infra/sqlite-snapshot-source.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../infra/sqlite-snapshot-source.js")>()),
   prepareSqliteReadOnlyLocation: mock.prepareSource,
-  prepareSqliteReadOnlyLocationAsync: mock.prepareSourceAsync,
+  startSqliteReadOnlyLocationAsync: (
+    ...args: Parameters<
+      typeof import("../infra/sqlite-snapshot-source.js").startSqliteReadOnlyLocationAsync
+    >
+  ) => {
+    const retained = retainFixturePreparation(
+      observeAsyncFixture(async () => {
+        const prepared: AsyncPreparedSqliteReadOnlyLocation = await mock.prepareSourceAsync(
+          ...args,
+        );
+        return {
+          ...prepared,
+          startCleanup: () => observeAsyncFixture(() => prepared.cleanupAsync()),
+        };
+      }),
+    );
+    return {
+      ...retained,
+      startClose() {
+        mock.closePreparation();
+        return retained.startClose();
+      },
+    };
+  },
 }));
 vi.mock("../infra/sqlite-readonly-location-cleanup.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../infra/sqlite-readonly-location-cleanup.js")>()),
@@ -84,9 +125,8 @@ const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
   }),
 );
 beforeEach(() => {
-  mock.excluded.mockReset().mockReturnValue(false);
-  mock.mutation.mockReset().mockReturnValue(undefined);
-  mock.releaseSourcePin.mockReset();
+  mock.constructTransport.mockReset();
+  mock.closePreparation.mockReset();
   mock.borrow.mockReset();
   mock.independent.mockReset();
   mock.prepareNative.mockReset().mockImplementation(async () => ({
@@ -107,7 +147,7 @@ beforeEach(() => {
   mock.close.mockReset().mockResolvedValue();
   mock.cleanup.mockReset().mockResolvedValue(true);
   mock.read.mockReset().mockResolvedValue({
-    value: { ok: true, type: "fleet.list", sourceAdmitted: true, cells: [] },
+    value: { ok: true, type: "backup.runs", sourceAdmitted: true, runs: [] },
   });
 });
 
@@ -119,56 +159,41 @@ function source() {
   return { path: pathname, env: { OPENCLAW_STATE_DIR: root } };
 }
 
-it("reads independently when native snapshot borrowing refuses a transaction", async () => {
+it("closes pending snapshot preparation before joining the read at shutdown", async () => {
   const options = source();
-  const observe = vi.fn();
-  const release = vi.fn();
-  mock.borrow.mockImplementation(() => {
-    throw new Error("Asynchronous shared-state reads cannot run inside a native transaction");
+  const started = createDeferredCore();
+  const preparation = createDeferredCore<AsyncPreparedSqliteReadOnlyLocation>();
+  const failure = new Error("snapshot preparation closed");
+  mock.prepareSourceAsync.mockImplementation(() => {
+    started.resolve();
+    return preparation.promise;
   });
-  mock.independent.mockReturnValue({ assertCurrent() {}, observe, release });
-  await expect(executeExistingOpenClawStateRead(options, { type: "fleet.list" })).resolves.toEqual({
-    ok: true,
-    type: "fleet.list",
-    sourceAdmitted: true,
-    cells: [],
-  });
-  expect(observe).toHaveBeenCalledOnce();
-  expect(release).toHaveBeenCalledOnce();
-  expect(mock.borrow).not.toHaveBeenCalled();
-  expect(mock.prepareNative).not.toHaveBeenCalled();
-  expect(mock.prepareSource).not.toHaveBeenCalled();
-  expect(mock.prepareSourceAsync).not.toHaveBeenCalled();
+  mock.closePreparation.mockImplementation(() => preparation.reject(failure));
+  finishProducer = () => preparation.reject(failure);
+  const result = withArtifactPreservingStateReads(() =>
+    executeExistingOpenClawStateRead(options, { type: "backup.runs" }),
+  ).catch((error: unknown) => error);
+  await started.promise;
+  await closeOpenClawStateDatabaseByPathAsync(options.path);
+  expect(await result).toBe(failure);
+  expect(mock.read).not.toHaveBeenCalled();
 });
 
-it.each(["ordinary", "excluded", "mutation"] as const)(
-  "prepares %s artifact reads from the retained native source with its cleanup owner",
-  async (mode) => {
-    const options = source();
-    const database = { db: {} };
-    const observe = vi.fn();
-    const release = vi.fn();
-    mock.excluded.mockReturnValue(mode === "excluded");
-    mock.mutation.mockReturnValue(mode === "mutation" ? () => {} : undefined);
-    mock.borrow.mockReturnValue({ database, assertCurrent() {}, observe, release });
-    await expect(
-      withArtifactPreservingStateReads(() =>
-        executeExistingOpenClawStateRead(options, { type: "fleet.list" }),
-      ),
-    ).resolves.toEqual({ ok: true, type: "fleet.list", sourceAdmitted: true, cells: [] });
-    expect(mock.prepareNative).toHaveBeenCalledWith(
-      database.db,
-      expect.any(Function),
-      ...(mode === "ordinary" ? [expect.any(AbortSignal), "async"] : []),
-    );
-    expect(mock.prepareSource).not.toHaveBeenCalled();
-    expect(mock.independent).not.toHaveBeenCalled();
-    expect(observe).toHaveBeenCalledOnce();
-    expect(release).toHaveBeenCalledOnce();
-    expect(mock.cleanup).toHaveBeenCalledOnce();
-    expect(mock.releaseSourcePin).toHaveBeenCalledTimes(mode === "ordinary" ? 0 : 1);
-  },
-);
+it("releases read ownership when transport construction fails", async () => {
+  const options = source();
+  const failure = new Error("transport construction failed");
+  mock.constructTransport.mockImplementation(() => {
+    throw failure;
+  });
+  await expect(
+    withOpenClawStateDatabaseReadSnapshot(
+      () => executeExistingOpenClawStateRead(options, { type: "backup.runs" }),
+      options,
+    ),
+  ).rejects.toBe(failure);
+  expect(mock.cleanup).toHaveBeenCalledOnce();
+  await closeOpenClawStateDatabaseByPathAsync(options.path);
+});
 
 it("retains the borrowed source through pending preparation and failed published cleanup", async () => {
   const options = source();
@@ -187,7 +212,7 @@ it("retains the borrowed source through pending preparation and failed published
   finishProducer = () =>
     prepared.resolve({ location: "/fixture/prepared.sqlite", cleanupAsync: mock.cleanup });
   const result = withArtifactPreservingStateReads(() =>
-    executeExistingOpenClawStateRead(options, { type: "fleet.list" }),
+    executeExistingOpenClawStateRead(options, { type: "backup.runs" }),
   ).catch((error: unknown) => error);
   await started.promise;
   const closing = closeOpenClawStateDatabaseByPathAsync(options.path).catch(
@@ -207,128 +232,58 @@ it("retains the borrowed source through pending preparation and failed published
   expect(release).toHaveBeenCalledOnce();
 });
 
-it("joins the cold snapshot query transport before producer cleanup", async () => {
-  const options = source();
-  const stopping = createDeferredCore();
-  const stopped = createDeferredCore();
-  const events: string[] = [];
-  mock.read.mockImplementation(async () => {
-    events.push("query completed");
-    return { value: { ok: true, type: "fleet.list", sourceAdmitted: true, cells: [] } };
-  });
-  mock.close.mockImplementationOnce(async () => {
-    events.push("transport closing");
-    stopping.resolve();
-    await stopped.promise;
-    events.push("transport stopped");
-  });
-  mock.cleanup.mockImplementation(async () => {
-    events.push("producer snapshot cleaned");
-    return true;
-  });
-  const result = withArtifactPreservingStateReads(() =>
-    executeExistingOpenClawStateRead(options, { type: "fleet.list" }),
-  );
-  try {
-    await stopping.promise;
-    expect(mock.prepareSourceAsync).toHaveBeenCalledExactlyOnceWith(options.path, {
-      preserveSourceArtifacts: true,
-      signal: expect.any(AbortSignal),
-    });
-    expect(mock.prepareSource).not.toHaveBeenCalled();
-    expect(mock.prepareNative).not.toHaveBeenCalled();
-    expect(mock.independent).not.toHaveBeenCalled();
-    expect(mock.read).toHaveBeenCalledExactlyOnceWith(
-      expect.objectContaining({
-        location: "/fixture/prepared.sqlite",
-        snapshotRoot: "/fixture/prepared",
-        checkFreshAdmission: true,
-        expectedIdentity: undefined,
-      }),
-      expect.objectContaining({
-        assertCurrent: expect.any(Function),
-        signal: expect.any(AbortSignal),
-      }),
-    );
-    expect(events).toEqual(["query completed", "transport closing"]);
-    expect(mock.cleanup).not.toHaveBeenCalled();
-  } finally {
-    stopped.resolve();
-  }
-  await expect(result).resolves.toEqual({
-    ok: true,
-    type: "fleet.list",
-    sourceAdmitted: true,
-    cells: [],
-  });
-  expect(events).toEqual([
-    "query completed",
-    "transport closing",
-    "transport stopped",
-    "producer snapshot cleaned",
-  ]);
-  expect(mock.close).toHaveBeenCalledOnce();
-  expect(mock.cleanup).toHaveBeenCalledOnce();
-});
-
-it("preserves native transaction refusal for artifact reads without independent fallback", async () => {
-  const options = source();
-  const failure = new Error(
-    "Asynchronous shared-state reads cannot run inside a native transaction",
-  );
-  mock.borrow.mockImplementation(() => {
-    throw failure;
-  });
-  mock.independent.mockReturnValue({ assertCurrent() {}, observe() {}, release() {} });
-  await expect(
-    withArtifactPreservingStateReads(() =>
-      executeExistingOpenClawStateRead(options, { type: "fleet.list" }),
-    ),
-  ).rejects.toBe(failure);
-  expect(mock.independent).not.toHaveBeenCalled();
-  expect(mock.prepareNative).not.toHaveBeenCalled();
-  expect(mock.prepareSource).not.toHaveBeenCalled();
-  expect(mock.prepareSourceAsync).not.toHaveBeenCalled();
-  expect(mock.read).not.toHaveBeenCalled();
-});
-
-it.each([false, true])(
-  "retains ordered cleanup for canonical retry after read failure=%s",
-  async (readFails) => {
+it.each(["failure", "success"] as const)(
+  "preserves read errors and checks successful reads before returning data (%s)",
+  async (outcome) => {
     const options = source();
-    const readFailure = new Error("read failed");
-    const stopFailure = new Error("transport stop not acknowledged");
-    if (readFails) {
-      mock.read.mockRejectedValue(readFailure);
+    const readFailure = new Error("worker query failed");
+    const observationFailure = new Error("native read owner retired");
+    const release = vi.fn();
+    mock.independent.mockReturnValue({
+      database: { db: {} },
+      assertCurrent() {},
+      observe() {
+        throw observationFailure;
+      },
+      release,
+    });
+    if (outcome === "failure") {
+      mock.read.mockResolvedValue({ error: readFailure, sourceAdmitted: true });
     }
-    mock.close.mockRejectedValueOnce(stopFailure);
-    mock.cleanup.mockResolvedValueOnce(false).mockResolvedValue(true);
-
-    const result = withArtifactPreservingStateReads(() =>
-      executeExistingOpenClawStateRead(options, { type: "fleet.list" }),
+    await expect(executeExistingOpenClawStateRead(options, { type: "backup.runs" })).rejects.toBe(
+      outcome === "failure" ? readFailure : observationFailure,
     );
-    if (readFails) {
-      await expect(result).rejects.toMatchObject({
-        cause: readFailure,
-        errors: [readFailure, stopFailure],
-      });
-    } else {
-      await expect(result).rejects.toBe(stopFailure);
-    }
-    expect(mock.cleanup).not.toHaveBeenCalled();
-    await expect(closeOpenClawStateDatabaseByPathAsync(options.path)).rejects.toThrow(
-      "snapshot cleanup failed",
-    );
-    expect(mock.close).toHaveBeenCalledTimes(2);
-    expect(() => captureOpenClawStateDatabaseReadAdmission(options.path)).toThrow(/closed/);
-    await expect(closeOpenClawStateDatabaseByPathAsync(options.path)).resolves.toBe(false);
-    expect(mock.close).toHaveBeenCalledTimes(2);
-    expect(mock.cleanup).toHaveBeenCalledTimes(2);
-    expect(() =>
-      captureOpenClawStateDatabaseReadAdmission(options.path).assertCurrent(),
-    ).not.toThrow();
+    expect(release).toHaveBeenCalledOnce();
   },
 );
+
+it("retains ordered cleanup for canonical retry after a read failure", async () => {
+  const options = source();
+  const readFailure = new Error("read failed");
+  const stopFailure = new Error("transport stop not acknowledged");
+  mock.read.mockRejectedValue(readFailure);
+  mock.close.mockRejectedValueOnce(stopFailure);
+  mock.cleanup.mockResolvedValueOnce(false).mockResolvedValue(true);
+
+  await expect(
+    withArtifactPreservingStateReads(() =>
+      executeExistingOpenClawStateRead(options, { type: "backup.runs" }),
+    ),
+  ).rejects.toMatchObject({ cause: readFailure, errors: [readFailure, stopFailure] });
+  expect(mock.cleanup).not.toHaveBeenCalled();
+  await expect(closeOpenClawStateDatabaseByPathAsync(options.path)).rejects.toThrow(
+    "snapshot cleanup failed",
+  );
+  expect(mock.close).toHaveBeenCalledTimes(2);
+  // Failed drainage leaves the database live, so reads resume until the retry seals again.
+  captureOpenClawStateDatabaseReadAdmission(options.path).assertCurrent();
+  await expect(closeOpenClawStateDatabaseByPathAsync(options.path)).resolves.toBe(false);
+  expect(mock.close).toHaveBeenCalledTimes(2);
+  expect(mock.cleanup).toHaveBeenCalledTimes(2);
+  expect(() =>
+    captureOpenClawStateDatabaseReadAdmission(options.path).assertCurrent(),
+  ).not.toThrow();
+});
 
 it("retains an outer snapshot until its child transport acknowledges cleanup", async () => {
   const options = source();
@@ -336,7 +291,7 @@ it("retains an outer snapshot until its child transport acknowledges cleanup", a
   mock.close.mockRejectedValueOnce(failure).mockRejectedValueOnce(failure).mockResolvedValue();
   await expect(
     withOpenClawStateDatabaseReadSnapshot(
-      () => executeExistingOpenClawStateRead(options, { type: "fleet.list" }),
+      () => executeExistingOpenClawStateRead(options, { type: "backup.runs" }),
       options,
     ),
   ).rejects.toMatchObject({ cause: failure });
@@ -351,32 +306,32 @@ it("keeps a composite snapshot alive when its callback closes the live writer", 
   await withOpenClawStateDatabaseReadSnapshot(async () => {
     await closeOpenClawStateDatabaseByPathAsync(options.path);
     expect(mock.cleanup).not.toHaveBeenCalled();
-    expect(await executeExistingOpenClawStateRead(options, { type: "fleet.list" })).toEqual({
+    expect(await executeExistingOpenClawStateRead(options, { type: "backup.runs" })).toEqual({
       ok: true,
-      type: "fleet.list",
+      type: "backup.runs",
       sourceAdmitted: true,
-      cells: [],
+      runs: [],
     });
   }, options);
   expect(mock.cleanup).toHaveBeenCalledTimes(1);
 });
 
-it("retries transport stop before waiting for a still-pending producer", async () => {
+it("retries transport stop and settles the already-selected query", async () => {
   const options = source();
   const started = createDeferredCore();
   const reply = createDeferredCore<OpenClawStateReadOutcome>();
   finishProducer = () =>
-    reply.resolve({ value: { ok: true, type: "fleet.list", sourceAdmitted: true, cells: [] } });
+    reply.resolve({ value: { ok: true, type: "backup.runs", sourceAdmitted: true, runs: [] } });
   mock.read.mockImplementation(() => {
     started.resolve();
     return reply.promise;
   });
   const failure = new Error("first stop not acknowledged");
   mock.close.mockRejectedValueOnce(failure).mockImplementation(async () => {
-    reply.resolve({ value: { ok: true, type: "fleet.list", sourceAdmitted: true, cells: [] } });
+    reply.resolve({ value: { ok: true, type: "backup.runs", sourceAdmitted: true, runs: [] } });
   });
   const observed = withArtifactPreservingStateReads(() =>
-    executeExistingOpenClawStateRead(options, { type: "fleet.list" }),
+    executeExistingOpenClawStateRead(options, { type: "backup.runs" }),
   ).then(
     (value) => ({ value }),
     (error: unknown) => ({ error }),
@@ -387,62 +342,20 @@ it("retries transport stop before waiting for a still-pending producer", async (
   await expect(closeOpenClawStateDatabaseByPathAsync(options.path)).resolves.toBe(false);
   expect(mock.close).toHaveBeenCalledTimes(2);
   expect(mock.cleanup).toHaveBeenCalledTimes(1);
-  expect(await observed).toMatchObject({
-    error: expect.objectContaining({ message: expect.stringMatching(/closed/) }),
+  expect(await observed).toEqual({
+    value: { ok: true, type: "backup.runs", sourceAdmitted: true, runs: [] },
   });
-});
-
-it.each([false, true])(
-  "observes the current source before reporting a query failure (admitted=%s)",
-  async (sourceAdmitted) => {
-    const options = source();
-    const failure = new Error("query failed");
-    const observe = vi.fn();
-    const release = vi.fn();
-    mock.independent.mockReturnValue({ assertCurrent() {}, observe, release });
-    mock.read.mockResolvedValue({
-      error: failure,
-      ...(sourceAdmitted ? { sourceAdmitted: true } : {}),
-    });
-    await expect(executeExistingOpenClawStateRead(options, { type: "fleet.list" })).rejects.toBe(
-      failure,
-    );
-    expect(observe).toHaveBeenCalledTimes(sourceAdmitted ? 1 : 0);
-    expect(release).toHaveBeenCalledOnce();
-  },
-);
-
-it("preserves the query failure without observing a source that lost its original authority", async () => {
-  const options = source();
-  const failure = new Error("query failed");
-  const retired = new Error("original source retired");
-  const assertCurrent = vi.fn();
-  const observe = vi.fn();
-  mock.independent.mockReturnValue({ assertCurrent, observe, release() {} });
-  mock.read.mockImplementation(async () => {
-    assertCurrent.mockImplementation(() => {
-      throw retired;
-    });
-    return { error: failure, sourceAdmitted: true };
-  });
-  await expect(
-    executeExistingOpenClawStateRead(options, { type: "fleet.list" }),
-  ).rejects.toMatchObject({
-    cause: failure,
-    errors: [failure, retired],
-  });
-  expect(observe).not.toHaveBeenCalled();
 });
 
 it("joins maintenance reads and retries their transport before closing scoped handles", async () => {
   const options = source();
-  const scope = createOpenClawDatabaseMaintenanceScope(() => undefined);
+  const scope = createOpenClawDatabaseMaintenanceScope();
   const started = createDeferredCore();
   const reply = createDeferredCore<OpenClawStateReadOutcome>();
   const events: string[] = [];
   const failure = new Error("transport stop not acknowledged");
   finishProducer = () =>
-    reply.resolve({ value: { ok: true, type: "fleet.list", sourceAdmitted: true, cells: [] } });
+    reply.resolve({ value: { ok: true, type: "backup.runs", sourceAdmitted: true, runs: [] } });
   mock.read.mockImplementation(() => {
     started.resolve();
     return reply.promise;
@@ -457,7 +370,7 @@ it("joins maintenance reads and retries their transport before closing scoped ha
     events.push("handle closed");
   });
   const operation = scope.run(() =>
-    executeExistingOpenClawStateRead(options, { type: "fleet.list" }),
+    executeExistingOpenClawStateRead(options, { type: "backup.runs" }),
   );
   const assertion = expect(operation).rejects.toBe(failure);
   await started.promise;

@@ -1,5 +1,6 @@
 import { DatabaseSync, StatementSync } from "node:sqlite";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { inspectConversationBindingAsync } from "openclaw/plugin-sdk/conversation-binding-inspection-runtime";
 import {
   registerSessionBindingAdapter,
   type SessionBindingAdapter,
@@ -37,12 +38,19 @@ const tempDirs = useAutoCleanupTempDirTracker((cleanup) => {
   });
 });
 
-const resolveOwner = matrixPlugin.messaging?.resolveConversationRouteOwner;
-if (!resolveOwner) {
+const prepareOwners = matrixPlugin.messaging?.prepareConversationRouteOwnersAsync;
+if (!prepareOwners) {
   throw new Error("Matrix conversation route owner is not registered");
 }
+async function resolveOwner(params: Parameters<NonNullable<typeof prepareOwners>>[0][number]) {
+  const [resolve] = await prepareOwners!([params], async (refs) => {
+    const inspections = await Promise.all(refs.map(inspectConversationBindingAsync));
+    return () => inspections;
+  });
+  return resolve!(params);
+}
 type Conversation = Parameters<typeof resolveOwner>[0]["conversation"];
-type Owner = ReturnType<typeof resolveOwner>;
+type Owner = Awaited<ReturnType<typeof resolveOwner>>;
 type Case = {
   name: string;
   conversation: Conversation;
@@ -154,7 +162,7 @@ describe.each(["per-user", "per-room"] as const)(
         agents: {
           ownership: "explicit",
           entries: {
-            main: { default: true },
+            main: {},
             "ops-agent": {},
             "sender-agent": {},
             "room-agent": {},
@@ -196,7 +204,7 @@ describe.each(["per-user", "per-room"] as const)(
       expect(loadMatrixCredentials(process.env, "ops")?.userId).toBe("@ops:example.org");
     });
 
-    it.each(cases)("preserves $name without credential SQL", (testCase) => {
+    it.each(cases)("preserves $name without credential SQL", async (testCase) => {
       const touch = vi.fn();
       const resolveByConversation = vi.fn<SessionBindingAdapter["resolveByConversation"]>(
         (conversation) =>
@@ -254,7 +262,11 @@ describe.each(["per-user", "per-room"] as const)(
         ),
       ];
       try {
-        const owner = resolveOwner({ cfg, accountId: "ops", conversation: testCase.conversation });
+        const owner = await resolveOwner({
+          cfg,
+          accountId: "ops",
+          conversation: testCase.conversation,
+        });
         const counts = counters.map((counter) => counter.mock.calls.length);
         expect(owner).toEqual(testCase.expected);
         expect(touch).not.toHaveBeenCalled();
@@ -287,3 +299,91 @@ describe.each(["per-user", "per-room"] as const)(
     });
   },
 );
+
+describe("inactive Matrix account scopes", () => {
+  beforeEach(() => {
+    for (const key of Object.keys(process.env).filter((name) => name.startsWith("MATRIX_"))) {
+      vi.stubEnv(key, undefined);
+    }
+    resetPluginRuntimeStateForTest();
+    resetPluginStateStoreForTests();
+    sessionBindingTesting.resetSessionBindingAdaptersForTests();
+    setActivePluginRegistry(
+      createTestRegistry([{ pluginId: "matrix", source: "test", plugin: matrixPlugin }]),
+    );
+  });
+
+  it.each([
+    {
+      name: "removed account",
+      accountId: "retired",
+      matrix: { accounts: { default: {} } },
+    },
+    {
+      name: "removed default account",
+      accountId: "default",
+      matrix: { enabled: true, accounts: { secondary: {} } },
+    },
+    {
+      name: "disabled account",
+      accountId: "default",
+      matrix: { accounts: { default: { enabled: false } } },
+    },
+    {
+      name: "disabled channel",
+      accountId: "default",
+      matrix: { enabled: false, accounts: { default: { enabled: true } } },
+    },
+  ] satisfies Array<{
+    name: string;
+    accountId: string;
+    matrix: NonNullable<OpenClawConfig["channels"]>["matrix"];
+  }>)(
+    "rejects a $name without requiring a runtime binding owner",
+    async ({ accountId, matrix }) => {
+      const cfg: OpenClawConfig = { channels: { matrix } };
+      installMatrixTestRuntime({ cfg });
+
+      expect(
+        await resolveOwner({
+          cfg,
+          accountId,
+          conversation: { kind: "channel", peerId: "!room:example.org" },
+        }),
+      ).toBeNull();
+    },
+  );
+
+  it("keeps a cached-credential-capable default without reading credentials", async () => {
+    const cfg: OpenClawConfig = {
+      channels: {
+        matrix: {
+          homeserver: "https://matrix.example.org",
+          userId: "@proof:example.org",
+          accounts: { secondary: {} },
+        },
+      },
+    };
+    installMatrixTestRuntime({ cfg });
+    expect(
+      await resolveOwner({
+        cfg,
+        accountId: "default",
+        conversation: { kind: "channel", peerId: "!room:example.org" },
+      }),
+    ).toEqual({ kind: "unavailable" });
+  });
+
+  it("rejects an empty scoped environment account", async () => {
+    vi.stubEnv("MATRIX_RETIRED_HOMESERVER", "");
+    const cfg: OpenClawConfig = { channels: { matrix: { accounts: { secondary: {} } } } };
+    installMatrixTestRuntime({ cfg });
+    expect(
+      await resolveOwner({
+        cfg,
+        accountId: "retired",
+        conversation: { kind: "channel", peerId: "!room:example.org" },
+      }),
+    ).toBeNull();
+  });
+});

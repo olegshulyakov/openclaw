@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
-import type { Page } from "playwright";
+import type { Locator, Page } from "playwright";
 import { expect } from "vitest";
 import { createRequireRecord } from "../../../test/helpers/record.js";
 import { SESSION_DRAG_MIME } from "../lib/sessions/drag.ts";
@@ -12,7 +12,10 @@ import {
   pauseVirtualClock,
   type MockGatewayRequest,
 } from "../test-helpers/control-ui-e2e.ts";
-import { createControlUiE2eSuite } from "./control-ui-e2e-suite.test-support.ts";
+import {
+  createControlUiE2eContextOptions,
+  createControlUiE2eSuite,
+} from "./control-ui-e2e-suite.test-support.ts";
 
 export {
   expectDefined,
@@ -24,6 +27,58 @@ export {
 };
 
 export const captureUiProofEnabled = process.env.OPENCLAW_CAPTURE_UI_PROOF === "1";
+
+// These suites track contexts and close them in their existing afterEach hook.
+export async function newChatPage(
+  suite: ReturnType<typeof createControlUiE2eSuite>,
+  options = createControlUiE2eContextOptions(),
+): Promise<Page> {
+  return (await suite.newBrowserContext(options)).newPage();
+}
+
+export function textContent(text: string) {
+  return [{ type: "text", text }];
+}
+
+export function chatMessage(role: string, text: string, extra?: Record<string, unknown>) {
+  return { role, content: textContent(text), ...extra };
+}
+
+export function thinkingLevels(...ids: string[]) {
+  return ids.map((id) => ({ id, label: id }));
+}
+
+export const QUEUED = [
+  "review the migration",
+  "then update the docs",
+  "finally run the smoke",
+] as const;
+
+export async function queueMessages(page: Page, messages: readonly string[] = QUEUED) {
+  const composer = page.locator(".agent-chat__composer-combobox textarea");
+  for (const message of messages) {
+    await composer.fill(message);
+    await composer.press("Enter");
+    await page.locator(".chat-queue__item", { hasText: message }).waitFor({ timeout: 10_000 });
+  }
+}
+
+export async function confirmIme(locator: Locator, text: string) {
+  return locator.evaluate((textarea, data) => {
+    textarea.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+    const end = new CompositionEvent("compositionend", { bubbles: true, data });
+    textarea.dispatchEvent(end);
+    const confirm = new KeyboardEvent("keydown", {
+      key: "Enter",
+      keyCode: 13,
+      bubbles: true,
+      cancelable: true,
+    });
+    Object.defineProperty(confirm, "timeStamp", { value: end.timeStamp - 1 });
+    textarea.dispatchEvent(confirm);
+    return confirm.defaultPrevented;
+  }, text);
+}
 
 export async function captureUiProof(
   owner: { readonly artifactDir: string },
@@ -187,11 +242,11 @@ export async function waitForChatScrollIdle(page: Page): Promise<void> {
 }
 
 export async function scrollChatThreadToTop(page: Page): Promise<void> {
-  await page.locator(".chat-pane-cache__pane--active .chat-thread").evaluate((element) => {
-    const thread = element as HTMLElement;
-    thread.scrollTop = 0;
-    thread.dispatchEvent(new Event("scroll", { bubbles: true }));
-  });
+  const thread = page.locator(".chat-pane-cache__pane--active .chat-thread");
+  // Reader input retires pending end-follow; a raw offset write can be maintenance.
+  await thread.hover();
+  await page.mouse.wheel(0, -(await thread.evaluate((element) => element.scrollHeight)));
+  await expect.poll(() => thread.evaluate((element) => element.scrollTop)).toBe(0);
 }
 
 export async function captureSessionAccessibilityProof(

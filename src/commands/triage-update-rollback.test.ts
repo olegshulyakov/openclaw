@@ -1,9 +1,13 @@
+import * as crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import * as atomicFiles from "../infra/json-files.js";
-import { writeTriageUpdateFailure } from "../infra/update-failure-report-artifact.js";
+import {
+  writeTriageUpdateFailure,
+  writeUpdateRunReportArtifact,
+} from "../infra/update-failure-report-artifact.js";
 import type { UpdateRunResult } from "../infra/update-runner-types.js";
 import {
   readTriageUpdateFailure,
@@ -11,6 +15,12 @@ import {
   updateFailureSchema,
 } from "./triage-update.js";
 import { readReleasedTriageUpdateFailure } from "./triage-update.released-reader.test-support.js";
+
+vi.mock("node:crypto", async () => {
+  const actual = await vi.importActual<typeof import("node:crypto")>("node:crypto");
+  return { ...actual, randomUUID: vi.fn(actual.randomUUID) };
+});
+afterEach(() => vi.mocked(crypto.randomUUID).mockReset());
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
@@ -92,19 +102,29 @@ describe("rollback-readable update diagnostics", () => {
       };
       const originalError =
         errorCount === 40
-          ? `Initial activation failure ${"diagnostic context ".repeat(100)}`
+          ? `Initial activation failure account 987654321098 ${"diagnostic context ".repeat(100)}`
           : undefined;
+      // A valid UUID with a numeric tail must remain a readable diagnostic link.
+      vi.mocked(crypto.randomUUID).mockReturnValue("00000000-0000-4000-8000-123456789012");
       const outputPath = await writeTriageUpdateFailure(
         { result, error: originalError },
         {
           env,
           ...(errorCount === 40
-            ? { outputPath: path.join(tempDirs.make("update-detached-"), "failure.json") }
+            ? {
+                outputPath: path.join(
+                  tempDirs.make("update-detached-"),
+                  "detached-diagnostics-".repeat(5),
+                  "failure.json",
+                ),
+              }
             : {}),
         },
       );
       const raw = await fs.readFile(outputPath, "utf8");
       expect(raw).not.toContain(secret);
+      expect(raw).not.toContain(stateDir);
+      expect(raw).not.toContain("987654321098");
       expect(Buffer.byteLength(raw)).toBeLessThanOrEqual(8 * 1024);
       const released = await readReleasedTriageUpdateFailure(outputPath, { env, stateDir });
       if (!released.error) {
@@ -123,6 +143,7 @@ describe("rollback-readable update diagnostics", () => {
       const inventory = JSON.parse(inventoryRaw);
       expect(inventory.result.steps[0].doctorLintFindings).toHaveLength(findingCount);
       expect(inventoryRaw).not.toContain(secret);
+      expect(inventoryRaw).not.toContain("987654321098");
       for (const finding of findings) {
         expect(inventoryRaw).toContain(finding.checkId);
         expect(inventoryRaw).toContain(finding.message);
@@ -152,6 +173,22 @@ describe("rollback-readable update diagnostics", () => {
       }
       if (errorCount === 40) {
         expect(receipt.omitted).toBeGreaterThan(0);
+        const reportPath = await writeUpdateRunReportArtifact({
+          result,
+          report: { markdown: "Synthetic update report" },
+          env,
+        });
+        const markdown = await fs.readFile(reportPath, "utf8");
+        const link = /^Bounded diagnostic JSON: ([^\r\n]+)$/mu.exec(markdown)?.[1];
+        expect(link).toBeDefined();
+        await expect(
+          readReleasedTriageUpdateFailure(path.resolve(path.dirname(reportPath), link!), {
+            env,
+            stateDir,
+          }),
+        ).resolves.toMatchObject({
+          error: expect.stringContaining("Complete Doctor lint inventory:"),
+        });
       }
       expect(bounded.result.steps[0]).toMatchObject(physical);
       expect(bounded.result.steps[0]).not.toHaveProperty("doctorLintFindings");
@@ -178,6 +215,67 @@ describe("rollback-readable update diagnostics", () => {
       }
     },
   );
+
+  it("keeps bounded diagnostics when the complete inventory locator cannot fit", async () => {
+    const stateDir = tempDirs.make("openclaw-update-triage-");
+    const env = { OPENCLAW_STATE_DIR: stateDir };
+    const outputPath = path.join(
+      tempDirs.make("update-detached-"),
+      ...Array.from({ length: 3 }, () => "detached-diagnostics-".repeat(10)),
+      "failure.json",
+    );
+    await writeTriageUpdateFailure(
+      {
+        error: "Original Doctor failure",
+        result: {
+          status: "error",
+          mode: "npm",
+          steps: [
+            {
+              name: "candidate doctor lint",
+              exitCode: 1,
+              doctorLintFindings: [
+                { checkId: "fixture/check", message: "Startup failed", severity: "error" },
+              ],
+            },
+          ],
+        },
+      },
+      { env, outputPath },
+    );
+    const raw = await fs.readFile(outputPath, "utf8");
+    const released = await readReleasedTriageUpdateFailure(outputPath, { env, stateDir });
+    expect(Buffer.byteLength(raw)).toBeLessThanOrEqual(8 * 1024);
+    expect(Buffer.byteLength(JSON.stringify(released.error))).toBeLessThanOrEqual(768);
+    expect(released.error).toContain("Original Doctor failure");
+    expect(released.error).toContain(
+      "Complete Doctor lint inventory unavailable: diagnostic link exceeds error limit.",
+    );
+    const receipt = JSON.parse(released.error!.split(" Doctor lint receipt: ")[1]!);
+    expect(receipt).toMatchObject({
+      exitCode: 1,
+      counts: { error: 1, warning: 0, info: 0 },
+      errors: [{ checkId: "fixture/check", message: "Startup failed" }],
+    });
+    expect(Buffer.byteLength(JSON.stringify(released))).toBeLessThanOrEqual(4 * 1024);
+    const inventoryName = (await fs.readdir(path.dirname(outputPath))).find((name) =>
+      name.startsWith("openclaw-update-lint-"),
+    );
+    expect(inventoryName).toBeDefined();
+    const inventory = JSON.parse(
+      await fs.readFile(path.join(path.dirname(outputPath), inventoryName!), "utf8"),
+    );
+    expect(inventory.result.steps[0].doctorLintFindings).toEqual([
+      { checkId: "fixture/check", message: "Startup failed", severity: "error" },
+    ]);
+    const copiedPath = await writeTriageUpdateFailure(released, {
+      env,
+      outputPath: path.join(stateDir, "copy.json"),
+    });
+    expect((await readReleasedTriageUpdateFailure(copiedPath, { env, stateDir })).error).toBe(
+      released.error,
+    );
+  });
 
   it("keeps the original bounded failure when the complete inventory cannot be written", async () => {
     const stateDir = tempDirs.make("openclaw-update-triage-");

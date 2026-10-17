@@ -9,14 +9,11 @@ const CALLERS = [
   ["extensions/feishu/src/bot.ts", "channelIngress:"],
   ["extensions/feishu/src/comment-handler.ts", "channelIngress:"],
   ["extensions/googlechat/src/monitor.ts", "channelIngress: access.channelIngress"],
-  [
-    "extensions/imessage/src/monitor/inbound-processing.ts",
-    "channelIngress: decision.channelIngress",
-  ],
+  ["extensions/imessage/src/monitor/inbound-processing.ts", "channelIngress,"],
   ["extensions/irc/src/inbound.ts", "channelIngress: access"],
   ["extensions/line/src/bot-message-context.ts", "channelIngress: params.channelIngress"],
   ["extensions/matrix/src/matrix/monitor/handler-context.ts", "channelIngress,"],
-  ["extensions/msteams/src/monitor-handler/inbound-dispatch.ts", "channelIngress:"],
+  ["extensions/msteams/src/monitor-handler/message-handler.ts", "channelIngress:"],
   ["extensions/nextcloud-talk/src/inbound.ts", "channelIngress: access"],
   ["extensions/qa-channel/src/inbound.ts", "channelIngress: access"],
   ["extensions/raft/src/inbound.ts", 'channelIngress: "unsupported"'],
@@ -27,7 +24,7 @@ const CALLERS = [
   ["extensions/telegram/src/bot-message-context.session.ts", "channelIngress,"],
   ["extensions/tlon/src/monitor/index.ts", "channelIngress,"],
   ["extensions/twitch/src/monitor.ts", "channelIngress,"],
-  ["extensions/whatsapp/src/auto-reply/monitor/prepared-inbound.ts", '| "channelIngress"'],
+  ["extensions/whatsapp/src/auto-reply/monitor/inbound-dispatch.ts", "channelIngress,"],
   ["extensions/zalo/src/monitor.ts", "channelIngress,"],
   ["extensions/zalouser/src/monitor.ts", "channelIngress: accessDecision"],
   ["src/channels/direct-dm.ts", "channelIngress: params.channelIngress"],
@@ -84,8 +81,8 @@ const HOST_BUILDERS = [
   ],
   ["extensions/matrix/src/matrix/monitor/handler-context.ts", "core.channel.inbound.buildContext"],
   [
-    "extensions/msteams/src/monitor-handler/inbound-dispatch.ts",
-    "core.channel.inbound.buildContext",
+    "extensions/msteams/src/monitor-handler/message-handler.ts",
+    "dispatchCore.channel.inbound.buildContext",
   ],
   ["extensions/nextcloud-talk/src/inbound.ts", "core.channel.inbound.buildContext"],
   [
@@ -99,14 +96,17 @@ const HOST_BUILDERS = [
     "ctx.buildContext ?? buildChannelInboundEventContext",
   ],
   ["extensions/sms/src/inbound.ts", "params.channelRuntime.inbound.buildContext"],
-  ["extensions/synology-chat/src/inbound-event.ts", "resolved.rt.channel.inbound.buildContext"],
+  ["extensions/synology-chat/src/inbound-event.ts", "rt.channel.inbound.buildContext"],
   [
     "extensions/telegram/src/bot-message-context.session.ts",
     "sessionRuntime.buildChannelInboundEventContext",
   ],
   ["extensions/tlon/src/monitor/index.ts", "core.channel.inbound.buildContext"],
   ["extensions/twitch/src/monitor.ts", "channelRuntime.inbound.buildContext"],
-  ["extensions/whatsapp/src/auto-reply/monitor/prepared-inbound.ts", "params.buildContext({"],
+  [
+    "extensions/whatsapp/src/auto-reply/monitor/inbound-dispatch.ts",
+    "params.buildContext ?? buildChannelInboundEventContext",
+  ],
   ["extensions/zalo/src/monitor.ts", "core.channel.inbound.buildContext"],
   ["extensions/zalouser/src/monitor.ts", "core.channel.inbound.buildContext"],
   [
@@ -132,10 +132,6 @@ const LATE_GLOBAL_BUILDERS = [
   [
     "extensions/slack/src/monitor/message-handler/prepare.ts",
     "getSlackRuntime().channel.inbound.buildContext",
-  ],
-  [
-    "extensions/telegram/src/bot-deps.ts",
-    "getTelegramRuntime().channel.inbound\n      .buildContext",
   ],
   [
     "extensions/whatsapp/src/auto-reply/monitor/inbound-dispatch.ts",
@@ -193,7 +189,7 @@ const SCOPED_BUILDER_HANDOFFS = [
   [
     "telegram",
     "extensions/telegram/src/bot-message.ts",
-    "buildContext ?? telegramDeps.buildChannelInboundEventContext",
+    "buildContext ?? buildChannelInboundEventContext",
   ],
   [
     "whatsapp",

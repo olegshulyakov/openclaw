@@ -1,12 +1,14 @@
-import { render } from "lit";
+import { createComponent } from "solid-js";
 import { vi } from "vitest";
-import { renderWhereChip, resolveWhereChip } from "./where-chip.ts";
+import { mountSolid } from "../../test-helpers/mount-solid.ts";
+import { resolveWhereChip, type WhereChipOptions } from "./where-chip.ts";
+import { WhereChip } from "./where-chip.tsx";
 
-export function renderPicker(
+export function pickerParams(
   isAdmin: boolean,
   autoPlacementMode?: "least-busy" | "eligible-order",
   selection: Partial<Parameters<typeof resolveWhereChip>[0]> = {},
-  presentation: Partial<Parameters<typeof renderWhereChip>[0]> = {},
+  presentation: Partial<WhereChipOptions> = {},
 ) {
   const state = resolveWhereChip({
     environments: [
@@ -40,34 +42,31 @@ export function renderPicker(
     deviceId: "",
     ...selection,
   });
-  const container = document.createElement("div");
-  render(
-    renderWhereChip({
-      state,
-      gatewayName: "",
-      environmentQuery: "",
-      onEnvironmentQueryInput: vi.fn(),
-      cloudProfileId: selection.cloudProfileId ?? "",
-      deviceId: selection.deviceId ?? "",
-      autoDevice: selection.autoDevice,
-      submitting: false,
-      pendingPlacement: false,
-      popoverOpen: true,
-      popoverHiding: false,
-      isAdmin,
-      ...(autoPlacementMode ? { autoPlacementMode } : {}),
-      onGuardTransition: vi.fn(),
-      onPopoverShow: vi.fn(),
-      onPopoverHide: vi.fn(),
-      onPopoverAfterHide: vi.fn(),
-      onSelectDevice: vi.fn(),
-      onSelectAutoDevice: vi.fn(),
-      onSelectCloudProfile: vi.fn(),
-      onConnectMachine: vi.fn(),
-      onManageCloudWorkers: vi.fn(),
-      ...presentation,
-    }),
-    container,
-  );
-  return container;
+  return {
+    state,
+    gatewayName: "",
+    environmentQuery: "",
+    onEnvironmentQueryInput: vi.fn(),
+    cloudProfileId: selection.cloudProfileId ?? "",
+    deviceId: selection.deviceId ?? "",
+    autoDevice: selection.autoDevice,
+    submitting: false,
+    pendingPlacement: false,
+    popoverOpen: true,
+    isAdmin,
+    ...(autoPlacementMode ? { autoPlacementMode } : {}),
+    onPopoverShow: vi.fn(),
+    onPopoverHide: vi.fn(),
+    onPopoverAfterHide: vi.fn(),
+    onSelectDevice: vi.fn(),
+    onSelectAutoDevice: vi.fn(),
+    onSelectCloudProfile: vi.fn(),
+    onConnectMachine: vi.fn(),
+    onManageCloudWorkers: vi.fn(),
+    ...presentation,
+  };
+}
+
+export function renderPicker(...args: Parameters<typeof pickerParams>) {
+  return mountSolid(() => createComponent(WhereChip, { params: pickerParams(...args) })).container;
 }

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createDeferredCore } from "../../../shared/deferred.js";
 import {
   admitFollowupRunLifecycle,
   completeFollowupRunLifecycle,
@@ -8,6 +9,67 @@ import {
 afterEach(() => vi.useRealTimers());
 
 describe("followup lifecycle heartbeat", () => {
+  it.each(["absent", "completed"] as const)(
+    "preserves a steer error with an %s lifecycle",
+    (kind) => {
+      const failure = new Error("steer notification failed");
+      const lifecycle = { onAdopted() {}, onSettled: vi.fn() };
+      if (kind === "completed") {
+        completeFollowupRunLifecycle({ turnAdoptionLifecycle: lifecycle });
+      }
+      expect(() =>
+        completeFollowupRunLifecycle({
+          turnAdoptionLifecycle: kind === "absent" ? undefined : lifecycle,
+          steerPending: {
+            phase: "waiting",
+            predecessor: Promise.resolve(true),
+            settle() {
+              throw failure;
+            },
+          },
+        }),
+      ).toThrow(failure);
+      expect(lifecycle.onSettled).toHaveBeenCalledTimes(kind === "completed" ? 1 : 0);
+    },
+  );
+
+  it("preserves a steer error while joining the already-started admission before settlement", async () => {
+    const entered = createDeferredCore();
+    const release = createDeferredCore();
+    const failure = new Error("steer notification failed");
+    const lifecycle = {
+      onAdopted: async () => {
+        entered.resolve();
+        await release.promise;
+      },
+      onAbandoned: vi.fn(),
+      onSettled: vi.fn(),
+    };
+    const run = {
+      turnAdoptionLifecycle: lifecycle,
+      steerPending: {
+        phase: "waiting" as const,
+        predecessor: Promise.resolve(true),
+        settle: () => {
+          throw failure;
+        },
+      },
+    };
+    const admission = admitFollowupRunLifecycle(run);
+    try {
+      await entered.promise;
+      expect(() => completeFollowupRunLifecycle(run)).toThrow(failure);
+      expect(lifecycle.onSettled).not.toHaveBeenCalled();
+      release.resolve();
+      await admission;
+      expect(lifecycle.onSettled).toHaveBeenCalledOnce();
+      expect(lifecycle.onAbandoned).not.toHaveBeenCalled();
+    } finally {
+      release.resolve();
+      await admission;
+    }
+  });
+
   it.each(["admitted", "completed", "aborted"] as const)(
     "does not start renewal for an already %s lifecycle",
     async (state) => {

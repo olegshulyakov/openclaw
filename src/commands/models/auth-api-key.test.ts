@@ -37,6 +37,8 @@ import {
   closeOpenClawStateDatabaseAsync,
   closeOpenClawStateDatabaseForTest,
 } from "../../state/openclaw-state-db.js";
+import { captureOpenClawStateWorkerContext } from "../../state/openclaw-state-worker-context.js";
+import { beginAuthProfileCredentialBatch } from "../../state/user-model-account-authority.js";
 import { saveModelProviderApiKey } from "./auth-api-key.js";
 import { removeModelAuthCredentials } from "./auth-logout.js";
 import * as configWriter from "./shared.js";
@@ -321,6 +323,7 @@ it.each(["configured", "explicit", "ordered"])(
       selection === "explicit" ? profileId : undefined,
     );
     const config = await readConfig();
+    expect(config.auth?.profiles?.[profileId]).toMatchObject(profileConfig);
     expect(savedProfile(profileId, owner ?? null)).toMatchObject({
       key: "synthetic-new-key",
       ...metadata,
@@ -561,6 +564,101 @@ it.each([
   expect(savedProfile(profileId, owner ?? null)).toEqual(credential);
   expect((await readConfig()).models).toEqual(config.models);
 });
+
+it.each([false, true])(
+  "preserves a shared key when an agent override wins the write wait (existing database=%s)",
+  async (existingDatabase) => {
+    const profileId = "sample:shared";
+    await seedKey(profileId, "synthetic-before");
+    if (existingDatabase) {
+      await seedKey("sample:other", "synthetic-other", "reader");
+    }
+    writeConfig({
+      agents: { ownership: "explicit", entries: { writer: {}, reader: {} } },
+      models: { providers: { sample: { ...connection, apiKey: profileId } } },
+    });
+    const beforeConfig = fs.readFileSync(configPath(), "utf8");
+    const update = authStoreRuntime.updateAuthProfileStoreWithLock;
+    vi.spyOn(authStoreRuntime, "updateAuthProfileStoreWithLock").mockImplementationOnce(
+      async (params) => {
+        await seedKey(profileId, "synthetic-override", "reader");
+        return update(params);
+      },
+    );
+
+    await expect(save()).rejects.toThrow("An agent already overrides this shared key");
+    expect(loadPersistedAuthProfileStore()?.profiles[profileId]).toMatchObject({
+      key: "synthetic-before",
+    });
+    expect(loadPersistedAuthProfileStore(agentDir("reader"))?.profiles[profileId]).toMatchObject({
+      key: "synthetic-override",
+    });
+    expect(fs.readFileSync(configPath(), "utf8")).toBe(beforeConfig);
+  },
+);
+
+it.each(["settled", "unknown", "closed", "override"] as const)(
+  "joins a pending credential publication before applying the saved key (%s)",
+  async (ending) => {
+    await seedKey("sample:other", "unrelated", "reader");
+    writeConfig({
+      agents: { ownership: "explicit", entries: { writer: {}, reader: {} } },
+      ...boundConfig("old-inline"),
+    });
+    const beforeConfig = configBytes();
+    const entered = createDeferred();
+    let batch: ReturnType<typeof beginAuthProfileCredentialBatch> | undefined;
+    const updateConfig = configWriter.updateConfig;
+    vi.spyOn(configWriter, "updateConfig").mockImplementationOnce((mutator, ...options) =>
+      updateConfig(
+        (...args) => {
+          batch = beginAuthProfileCredentialBatch(captureOpenClawStateWorkerContext());
+          entered.resolve();
+          return mutator(...args);
+        },
+        ...options,
+      ),
+    );
+    const response = save().then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    );
+    try {
+      await entered.promise;
+      expect(
+        await Promise.race([response.then(() => "settled"), nextEventLoopTurn("pending")]),
+      ).toBe("pending");
+      if (ending === "closed") {
+        await closeOpenClawStateDatabaseAsync();
+      } else {
+        if (ending === "override") {
+          await seedKey("sample:manual", "agent-override", "reader");
+        }
+        batch?.finish(ending !== "unknown");
+      }
+      const outcome = await response;
+      if (ending === "settled") {
+        expect(outcome).toMatchObject({ value: { profileId: "sample:manual" } });
+        expect((await readProvider())?.apiKey).toBe("sample:manual");
+        expect(savedProfile("sample:manual", null)).toMatchObject({ key: "synthetic-new-key" });
+      } else {
+        const reason =
+          ending === "override"
+            ? "An agent already overrides this shared key"
+            : ending === "unknown"
+              ? "Auth profile credential authority is unavailable"
+              : "read admission";
+        expect(outcome).toMatchObject({
+          error: expect.objectContaining({ message: expect.stringContaining(reason) }),
+        });
+        expect(configBytes()).toBe(beforeConfig);
+      }
+    } finally {
+      batch?.finish(true);
+      await response;
+    }
+  },
+);
 
 it("reports saved key material separately from failed config application and redacts it", async () => {
   vi.spyOn(configWriter, "updateConfig").mockRejectedValueOnce(new Error("config write failed"));
